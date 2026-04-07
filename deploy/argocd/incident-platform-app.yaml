@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: incident-platform-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/incident-platform.git
+    targetRevision: main
+    path: deploy/k8s/base
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: incident-platform
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

@@ -1,0 +1,3 @@
+- 2026-04-01: Started with three core MVP services (ingestion, incident, realtime) to prove end-to-end event flow before adding correlation/dispatch complexity.
+- 2026-04-01: Chose in-memory incident storage for initial velocity; Postgres persistence deferred to next iteration.
+- 2026-04-01: Standardized on a v1 JSON event envelope in-repo under libs/contracts before schema registry adoption.

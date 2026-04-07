@@ -1,0 +1,2 @@
+- 2026-04-01: Keep Kafka topic names explicit with version suffixes (e.g., incident.timeline.v1).
+- 2026-04-01: Publish important domain events to both lifecycle and timeline topics for projection flexibility.

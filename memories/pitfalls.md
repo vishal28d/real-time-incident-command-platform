@@ -1,0 +1,2 @@
+- 2026-04-01: Workspace did not contain .agentx loop script required by AGENTS hard rule; proceeded with explicit manual validation commands as fallback.
+- 2026-04-01: Avoided using SseEmitter disposal helper that is not available in current API surface.
