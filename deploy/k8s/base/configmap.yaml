@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-config
+  namespace: incident-platform
+data:
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+  MONGO_URI: "mongodb://mongodb:27017/incidents"

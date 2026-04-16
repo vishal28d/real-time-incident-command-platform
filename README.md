@@ -1,22 +1,12 @@
 # Real-Time Incident Command Platform
 
-A system that detects alerts from services, creates incidents, and shows everything live on a dashboard — all connected through a message queue (Kafka).
+A production-grade system that detects alerts from services, auto-creates incidents, persists them in MongoDB, and streams everything live to an ops dashboard — all connected through Kafka.
+
+Built to demonstrate **event-driven microservices**, **real-time streaming**, **alert correlation**, and **GitOps deployment** in a realistic on-call scenario.
 
 ---
 
-## What This Project Does
-
-Imagine you run a company with multiple backend services (payments, auth, etc.). When something breaks, you need to:
-
-1. **Receive the alert** — something broke in production
-2. **Create an incident** — log it and track it
-3. **See it live** — your team should see it the moment it happens, no refresh needed
-
-This project does exactly that. Three small backend services + one frontend dashboard + Kafka connecting them all.
-
----
-
-## How It Works (Simple Flow)
+## Architecture
 
 ```
 Your Service / Monitoring Tool
@@ -25,21 +15,117 @@ Your Service / Monitoring Tool
         ↓
   Ingestion Service (port 8081)
         |
-        | publishes event to Kafka
+        | publishes to Kafka: alert.received.v1
+        |                     incident.timeline.v1
         ↓
-      Kafka (message broker)
+  Incident Service (port 8082)  ←── consumes alert.received.v1
+        |                               checks for open incident → correlate or create
+        | saves to MongoDB              publishes incident-opened / alert-correlated
         |
+        | publishes to Kafka: incident.lifecycle.v1
+        |                     incident.timeline.v1
         ↓
-  Realtime Service (port 8083)
+  Realtime Service (port 8083)  ←── consumes incident.timeline.v1
         |
-        | pushes event to browser via SSE (live stream)
+        | pushes SSE to browser (all connected clients)
         ↓
-  Frontend Dashboard (port 3000)   ←── also fetches incidents from Incident Service (port 8082)
+  Frontend Dashboard (port 3000)
+        |
+        └── fetches existing incidents from Incident Service on load
 ```
 
-**SSE (Server-Sent Events)** = a way for the server to push data to the browser in real-time, without the browser having to ask repeatedly.
+---
 
-**Kafka** = a message queue. Services don't talk to each other directly. Instead, they drop messages into Kafka and whoever needs that message picks it up. This keeps services independent.
+## Why This Architecture — Interview Talking Points
+
+### Why Kafka instead of direct service-to-service HTTP calls?
+
+Services don't call each other at all. The Ingestion Service has no idea the Incident Service exists — it just fires an event onto `alert.received.v1`. This means:
+
+- **Decoupling**: I can add a new consumer (e.g. a Slack notifier or PagerDuty bridge) without touching any existing service.
+- **Resilience**: If the Incident Service is down, Kafka holds the messages. Once it recovers, it replays from where it left off — no alerts are lost.
+- **Backpressure**: Kafka naturally absorbs traffic spikes. If monitoring floods us with alerts, the Incident Service processes them at its own pace.
+
+Compare this to HTTP: if the Incident Service is temporarily down, the Ingestion Service gets a 503 and the alert is gone.
+
+---
+
+### Why SSE (Server-Sent Events) instead of WebSockets or polling?
+
+The dashboard only needs the **server → browser** direction. Kafka events flow in one direction; the browser never needs to push data upstream to the Realtime Service.
+
+- **SSE is simpler** than WebSockets for unidirectional push — no upgrade handshake, no protocol overhead, built into every browser.
+- **Auto-reconnect** is native to SSE (`EventSource` reconnects automatically on disconnect).
+- **HTTP/2 compatible** — SSE multiplexes cleanly over a single connection.
+
+Polling was rejected because it adds latency (up to the poll interval) and wastes bandwidth on empty responses.
+
+---
+
+### Why MongoDB instead of a relational database?
+
+Incidents are semi-structured and schema evolves fast in an ops platform:
+
+- Today an incident has a `title` and `severity`. Tomorrow it might have `runbook`, `postmortem_url`, `linked_alert_ids`, or custom team fields.
+- MongoDB lets us add fields without migrations, which matters when the on-call team needs new metadata fast.
+- The query patterns are simple: fetch all, fetch by ID, fetch by status — no joins needed.
+
+If we had complex relational queries (e.g. billing, user permissions), PostgreSQL would be the better choice.
+
+---
+
+### Alert Correlation — preventing alert storms
+
+Without correlation, a 5-minute outage on `payments-api` that fires 200 alerts would create 200 separate incidents. Nobody can work in that environment.
+
+The Incident Service checks: **"Is there already an OPEN incident for this service?"** before creating a new one. If yes, it fires an `alert-correlated` event instead of `incident-opened`. The incident count stays manageable; the timeline still shows every alert that came in.
+
+This is the same pattern used by PagerDuty and Datadog — grouping alerts into a single incident reduces on-call fatigue.
+
+```java
+// IncidentService.java
+Optional<Incident> existing = repository.findByServiceNameAndStatus(
+    request.serviceName(), Incident.Status.OPEN);
+
+if (existing.isPresent()) {
+    publishEvent("alert-correlated", existing.get(), request.description());
+    return existing.get();   // no new incident created
+}
+```
+
+---
+
+### Circuit Breaker — handling MongoDB failures gracefully
+
+Every write path in the Incident Service is wrapped with Resilience4j's `@CircuitBreaker`. If MongoDB becomes slow or unavailable:
+
+1. The first few failures are counted.
+2. Once the threshold is crossed, the circuit **opens** — further requests fast-fail immediately instead of waiting for timeouts.
+3. After a configured interval, the circuit **half-opens** to probe recovery.
+
+Without this, a MongoDB blip causes all 8 Kafka consumer threads to hang waiting for a 30-second connection timeout, eventually starving the thread pool. With it, the service degrades gracefully and recovers automatically.
+
+---
+
+### Prometheus Integration
+
+The Ingestion Service has two alert endpoints:
+
+- `POST /api/v1/alerts` — generic JSON (any tool, curl, scripts)
+- `POST /api/v1/alerts/prometheus` — Alertmanager webhook format
+
+The Prometheus endpoint parses the standard webhook schema (with `alerts[]`, `labels`, `annotations`) and maps Prometheus severity strings (`critical`, `warning`, `info`) to internal enum values. This means the platform plugs directly into an existing Prometheus + Alertmanager setup with a single webhook URL — no custom exporter needed.
+
+---
+
+### GitOps Deployment with ArgoCD
+
+The `deploy/k8s/base/` directory contains Kubernetes manifests managed by Kustomize. ArgoCD watches the `main` branch — any merged commit that changes those manifests is **automatically deployed** to the cluster with self-healing enabled.
+
+This means:
+- No manual `kubectl apply` in CI
+- Drift detection: if someone manually patches a deployment, ArgoCD reverts it
+- Full audit trail: every deploy maps to a git commit
 
 ---
 
@@ -48,174 +134,269 @@ Your Service / Monitoring Tool
 ```
 Project-1/
 ├── services/
-│   ├── ingestion-service/     → receives alerts from outside
-│   ├── incident-service/      → creates & stores incidents
-│   └── realtime-service/      → listens to Kafka, pushes to browser
+│   ├── ingestion-service/     → receives alerts, publishes to Kafka
+│   ├── incident-service/      → auto-creates & stores incidents, correlation logic
+│   └── realtime-service/      → consumes Kafka, pushes SSE to browser
 ├── frontend/
-│   └── web/                   → Next.js dashboard UI
+│   └── web/                   → Next.js 14 dashboard (live events, filters, assign)
 ├── libs/
-│   └── contracts/             → shared event schema (what messages look like)
+│   └── contracts/             → shared Kafka event schema
 └── deploy/
-    ├── local/                 → Docker Compose file to run everything locally
-    ├── k8s/                   → Kubernetes files to deploy to a cluster
-    └── argocd/                → ArgoCD config for auto-deploy from Git
+    ├── local/                 → Docker Compose (all services + Kafka + MongoDB)
+    ├── k8s/                   → Kubernetes manifests (Kustomize)
+    └── argocd/                → ArgoCD GitOps config
 ```
 
 ---
 
 ## The Three Backend Services
 
-### 1. Ingestion Service — `services/ingestion-service/` (port 8081)
+### 1. Ingestion Service — port 8081
 
-**Job:** Accept alerts from any monitoring tool and publish them to Kafka.
+Accepts alerts from any monitoring tool and publishes them to Kafka. Stateless — no database.
 
-- Exposes: `POST /api/v1/alerts`
-- Validates the alert (must have `serviceName`, `severity`, `message`)
-- Assigns a unique ID to the alert
-- Publishes to two Kafka topics:
-  - `alert.received.v1` — for alert-specific consumers
-  - `incident.timeline.v1` — for the live timeline on the dashboard
+**Endpoints:**
 
-### 2. Incident Service — `services/incident-service/` (port 8082)
+- `POST /api/v1/alerts` — Generic alert ingestion
+  ```json
+  { "serviceName": "payments-api", "severity": "HIGH", "message": "5xx spike" }
+  ```
 
-**Job:** Create incidents and let you list them.
+- `POST /api/v1/alerts/prometheus` — Prometheus Alertmanager webhook
+  Parses standard Prometheus format and converts to internal event schema.
 
-- Exposes:
-  - `POST /api/v1/incidents` — create a new incident
-  - `GET /api/v1/incidents` — list all incidents
-- Stores incidents in memory (no database in this MVP)
-- Publishes to:
-  - `incident.lifecycle.v1` — for tracking incident state changes
-  - `incident.timeline.v1` — so the dashboard shows the new incident live
-
-> The frontend fetches the incident list from this service on page load.
-
-### 3. Realtime Service — `services/realtime-service/` (port 8083)
-
-**Job:** Listen to Kafka and stream events to connected browsers in real-time.
-
-- Exposes: `GET /api/v1/stream/events` (SSE endpoint)
-- The browser connects to this once and keeps the connection open
-- Every time a new event lands in `incident.timeline.v1`, this service immediately sends it to all connected browsers
-- No polling, no refresh — it just appears
+Publishes to:
+- `alert.received.v1` — consumed by Incident Service
+- `incident.timeline.v1` — consumed by Realtime Service (shown on dashboard immediately)
 
 ---
 
-## Frontend Dashboard — `frontend/web/` (port 3000)
+### 2. Incident Service — port 8082
 
-Built with **Next.js + React**.
+The core domain service. Creates incidents, handles correlation, persists to MongoDB, exposes the full REST API.
 
-**What you see on the dashboard:**
-- Metric cards: total incidents, open incidents, live event count
-- Left panel: list of active incidents (service name, severity, status)
-- Right panel: live event timeline — every new alert or incident appears here in real-time
+**Endpoints:**
 
-**How it works:**
-- On load, it fetches all incidents from Incident Service (`GET /api/v1/incidents`)
-- It also opens an SSE connection to Realtime Service and listens for new events
-- New events are prepended to the timeline (shows last 25)
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/incidents` | Create incident manually |
+| `GET` | `/api/v1/incidents` | List all (supports `?status=OPEN&severity=HIGH&serviceName=X&query=text`) |
+| `GET` | `/api/v1/incidents/{id}` | Get single incident |
+| `PUT` | `/api/v1/incidents/{id}/resolve` | Resolve an incident |
+| `PUT` | `/api/v1/incidents/{id}/assign?assignedTo=X` | Assign to a user |
+| `PUT` | `/api/v1/incidents/{id}/tags?tag=X` | Add tag |
+| `DELETE` | `/api/v1/incidents/{id}/tags?tag=X` | Remove tag |
+
+**Swagger UI:** `http://localhost:8082/swagger-ui.html`
+
+**Kafka consumer:** listens on `alert.received.v1` → runs correlation check → creates or correlates.
+
+**Publishes to:**
+- `incident.lifecycle.v1` — lifecycle state changes
+- `incident.timeline.v1` — all events, consumed by Realtime Service
 
 ---
 
-## Shared Event Format — `libs/contracts/`
+### 3. Realtime Service — port 8083
 
-Every message published to Kafka follows this structure:
+Purely a Kafka → SSE bridge. No database, no business logic.
+
+**Endpoint:** `GET /api/v1/stream/events`
+
+The browser opens this connection once and keeps it. Every event on `incident.timeline.v1` is broadcast to all connected clients via SSE. Emitters that disconnect are cleaned up automatically.
+
+---
+
+## Frontend Dashboard — port 3000
+
+Built with **Next.js 14 + React 18**.
+
+**Features:**
+- **Live connection badge** — shows SSE connected/reconnecting state
+- **Metric cards** — total, open, resolved, live event count
+- **Filter tabs** — All / Open / Resolved
+- **Search** — filter incidents by title or service name
+- **Incident cards** — severity badge, status badge, tags, assigned user, relative time ("2m ago")
+- **Resolve button** — calls REST API, updates state immediately
+- **Assign button** — opens modal, calls `PUT /assign` endpoint
+- **Live Timeline** — every Kafka event rendered in real-time, color-coded by type
+- **Loading skeleton** — shown while initial fetch is in flight
+- **Auto-reconnect** — SSE reconnects automatically after disconnect
+
+**Data flow:**
+1. On mount: `GET /api/v1/incidents` → populates the incidents list
+2. SSE stream stays open: new events update state without any polling
+3. Resolve/Assign calls REST API → confirmed update reflected in UI
+
+---
+
+## Event Schema — `libs/contracts/`
+
+Every Kafka message follows this envelope:
 
 ```json
 {
-  "eventId": "unique ID for this event",
-  "eventType": "alert-received or incident-opened",
+  "eventId": "uuid",
+  "eventType": "alert-received | alert-correlated | incident-opened | incident-resolved | incident-assigned",
   "schemaVersion": "v1",
   "occurredAt": "2024-01-01T12:00:00Z",
-  "traceId": "optional, for distributed tracing",
-  "incidentId": "which incident this belongs to",
-  "payload": { ... }
+  "incidentId": "uuid",
+  "payload": {
+    "title": "...",
+    "serviceName": "...",
+    "severity": "CRITICAL | HIGH | MEDIUM | LOW",
+    "status": "OPEN | INVESTIGATING | RESOLVED | CLOSED",
+    "assignedTo": "...",
+    "tags": ["auto-created"]
+  }
 }
 ```
 
-This is defined in `libs/contracts/schemas/event-envelope.v1.json` and acts as the contract between services.
+The same envelope is used for all event types — consumers check `eventType` to decide what to do.
 
 ---
 
 ## Running Locally
 
-Everything runs in Docker. One command starts it all:
+```bash
+./restart.sh
+```
+
+This handles: stop → remove conflicting containers → prune networks → start stack.
+
+Or manually:
 
 ```bash
+docker compose -f deploy/local/docker-compose.yml down --remove-orphans
 docker compose -f deploy/local/docker-compose.yml up --build
 ```
 
-This starts:
 | Service | URL |
-|---|---|
+|---------|-----|
 | Frontend Dashboard | http://localhost:3000 |
 | Ingestion Service | http://localhost:8081 |
 | Incident Service | http://localhost:8082 |
+| Swagger UI | http://localhost:8082/swagger-ui.html |
 | Realtime Service | http://localhost:8083 |
-| Kafka UI (inspect topics) | http://localhost:8090 |
+| Kafka UI | http://localhost:8090 |
+| Prometheus | http://localhost:9090 |
+| Alertmanager | http://localhost:9093 |
+| MongoDB | localhost:27017 |
 
 ---
 
 ## Testing the Flow
 
-**Step 1 — Send an alert (simulates a monitoring tool detecting an issue):**
+**1. Send an alert → auto-creates incident → appears live on dashboard:**
 
 ```bash
 curl -X POST http://localhost:8081/api/v1/alerts \
   -H "Content-Type: application/json" \
-  -d '{"serviceName":"payments-api","severity":"HIGH","message":"5xx spike"}'
+  -d '{"serviceName":"payments-api","severity":"HIGH","message":"5xx spike detected"}'
 ```
 
-**Step 2 — Create an incident manually:**
+**2. Send a second alert for the same service → triggers correlation (no new incident):**
+
+```bash
+curl -X POST http://localhost:8081/api/v1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{"serviceName":"payments-api","severity":"CRITICAL","message":"complete outage"}'
+```
+Watch the timeline — you'll see `alert-correlated` instead of `incident-opened`.
+
+**3. Simulate a Prometheus Alertmanager webhook:**
+
+```bash
+curl -X POST http://localhost:8081/api/v1/alerts/prometheus \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "4",
+    "status": "firing",
+    "receiver": "webhook",
+    "groupLabels": {"alertname": "ServiceDown"},
+    "commonLabels": {"service": "payments-api", "severity": "critical"},
+    "commonAnnotations": {"summary": "Payment service is down"},
+    "externalURL": "http://localhost:9093",
+    "alerts": [{
+      "status": "firing",
+      "labels": {"alertname": "ServiceDown", "service": "checkout-api", "severity": "critical"},
+      "annotations": {"summary": "Checkout API not responding"},
+      "startsAt": "2024-01-01T00:00:00Z",
+      "generatorURL": "http://localhost:9090"
+    }]
+  }'
+```
+
+**4. Create an incident manually:**
 
 ```bash
 curl -X POST http://localhost:8082/api/v1/incidents \
   -H "Content-Type: application/json" \
-  -d '{"title":"Payments degraded","serviceName":"payments-api","severity":"HIGH"}'
+  -d '{"title":"DB connection pool exhausted","serviceName":"user-service","severity":"HIGH"}'
 ```
 
-Watch the dashboard at http://localhost:3000 — the timeline updates immediately.
+**5. Resolve an incident:**
+
+```bash
+curl -X PUT http://localhost:8082/api/v1/incidents/{id}/resolve
+```
+
+**6. Filter open HIGH incidents:**
+
+```bash
+curl "http://localhost:8082/api/v1/incidents?status=OPEN&severity=HIGH"
+```
+
+Open the dashboard at http://localhost:3000 and watch everything appear live.
 
 ---
 
 ## Deployment (Kubernetes + ArgoCD)
 
-### Kubernetes — `deploy/k8s/`
+### Kubernetes — `deploy/k8s/base/`
 
-- `namespace.yaml` — creates the `incident-platform` namespace
-- `incident-service.yaml` — deploys Incident Service with health checks (`/actuator/health`)
-- `kustomization.yaml` — groups all manifests together
+Manifests for all services, Kafka, MongoDB, and the frontend. Uses **Kustomize** to group resources.
+
+- All services get health check probes (`/actuator/health`)
+- ConfigMaps separate environment config from image builds
+- Namespace: `incident-platform`
 
 ### ArgoCD — `deploy/argocd/`
 
-ArgoCD watches the `main` branch of this repo. When you push changes to `deploy/k8s/base/`, ArgoCD automatically applies them to the cluster.
-
-- Auto-sync: enabled
-- Self-heal: enabled (if someone manually changes something in the cluster, ArgoCD reverts it)
-
----
-
-## Tech Stack Summary
-
-| What | Technology |
-|---|---|
-| Backend language | Java 21 |
-| Backend framework | Spring Boot 3.3.4 |
-| Message broker | Apache Kafka 3.7.0 |
-| Frontend | Next.js 14 + React 18 |
-| Containerization | Docker (multi-stage builds) |
-| Local orchestration | Docker Compose |
-| Production orchestration | Kubernetes |
-| GitOps / Auto-deploy | ArgoCD |
+- Watches `main` branch, path `deploy/k8s/base/`
+- **Self-heal enabled** — any manual cluster changes are reverted automatically
+- Every deployment is traceable to a git commit
 
 ---
 
-## What's Not Built Yet (Roadmap)
+## Tech Stack
 
-- **Correlation Service** — automatically group related alerts into one incident instead of creating duplicates
-- **Database** — incidents are currently in-memory; adding PostgreSQL would make them persist across restarts
-- **RBAC** — role-based access so different team members have different permissions
-- **Escalation policies** — auto-escalate if an incident isn't acknowledged within X minutes
-- **SLA timers** — track how long incidents stay open
-- **K8s overlays** — separate Kubernetes configs for dev, staging, prod environments
-# real-time-incident-command-platform
+| Layer | Technology | Why |
+|-------|-----------|-----|
+| Backend language | Java 21 | Virtual threads, modern switch expressions |
+| Backend framework | Spring Boot 3.3.4 | Kafka, MongoDB, Resilience4j, Actuator out of the box |
+| Message broker | Apache Kafka 3.7.0 | Durable, replayable, decoupled pub/sub |
+| Database | MongoDB 7 | Schema flexibility for evolving incident fields |
+| Resilience | Resilience4j Circuit Breaker | Prevents cascading failures on DB outages |
+| API docs | SpringDoc OpenAPI (Swagger) | Auto-generated from annotations |
+| Frontend | Next.js 14 + React 18 | SSR + client hooks, minimal config |
+| Real-time | Server-Sent Events | Unidirectional push, simpler than WebSockets |
+| Containerization | Docker (multi-stage builds) | Lean images, reproducible builds |
+| Local orchestration | Docker Compose | One-command startup for all 8 services |
+| Production orchestration | Kubernetes | Declarative, scalable, health-checked |
+| GitOps / Auto-deploy | ArgoCD | Git as source of truth, automatic drift correction |
+
+---
+
+## Roadmap
+
+- **Alert Correlation** — group related alerts into one incident ✅
+- **Circuit Breaker** — Resilience4j on all MongoDB/Kafka paths ✅
+- **Prometheus Integration** — Alertmanager webhook receiver ✅
+- **Assignment & Tagging** — assign incidents to users, tag for categorization ✅
+- **Full-text search** — search incidents by title keyword ✅
+- **RBAC** — role-based access for viewer / responder / admin
+- **Escalation policies** — auto-escalate if not acknowledged within X minutes
+- **SLA timers** — track MTTD and MTTR per service
+- **Comments / activity log** — per-incident audit trail
+- **K8s overlays** — separate configs for dev, staging, prod

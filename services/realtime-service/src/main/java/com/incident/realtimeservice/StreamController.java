@@ -29,13 +29,14 @@ public class StreamController {
 
     @KafkaListener(topics = "incident.timeline.v1", groupId = "realtime-service")
     public void onTimelineEvent(Map<String, Object> event) {
-        emitters.forEach(emitter -> {
+        List<SseEmitter> dead = new java.util.ArrayList<>();
+        for (SseEmitter emitter : emitters) {
             try {
                 emitter.send(SseEmitter.event().name("incident-event").data(event));
-            } catch (IOException ex) {
-                emitter.complete();
-                emitters.remove(emitter);
+            } catch (Exception ex) {
+                dead.add(emitter);
             }
-        });
+        }
+        emitters.removeAll(dead);
     }
 }

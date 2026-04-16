@@ -1,5 +1,0 @@
-- 2026-04-01: Implemented initial monorepo scaffold for backend, frontend, contracts, and deployment assets.
-- 2026-04-01: Added three Spring Boot services and one Next.js dashboard shell.
-- 2026-04-01: Added local Docker Compose stack with Kafka and Kafka UI.
-- 2026-04-01: Added base Kubernetes + ArgoCD starter manifests.
-- Next: add correlation-service, incident persistence (Postgres), and escalation policy.
